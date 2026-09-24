@@ -1,160 +1,95 @@
 import os
-import tempfile
 import streamlit as st
-
-# Modern LangChain imports
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
+from sentence_transformers import SentenceTransformer
 
-# CORRECTED CHAIN IMPORTS
-from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+st.set_page_config(page_title="Chat with PDF - Llama & Groq", layout="centered")
+st.title("📄 Chat with PDF using Llama (via Groq Cloud)")
 
-st.set_page_config(
-    page_title="Local PDF Chatbot", page_icon="🤖", layout="centered"
-)
-st.title("📁 Local PDF Chatbot (100% Offline)")
-st.caption(
-    "Running locally via Ollama (Llama 3.2:3b) & ChromaDB optimized for 6 GB RAM."
-)
+# Sidebar Configuration
+st.sidebar.header("Configuration")
+groq_api_key = st.sidebar.text_input("Enter your Groq API Key:", type="password")
+uploaded_file = st.sidebar.file_uploader("Upload a PDF file", type="pdf")
 
-# Initialize Session State
-if "rag_chain" not in st.session_state:
-    st.session_state.rag_chain = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if groq_api_key and uploaded_file:
+    # Save the uploaded PDF temporarily to disk for processing
+    with open("temp.pdf", "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-# Sidebar for PDF Upload
-with st.sidebar:
-    st.header("Upload Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+    @st.cache_resource
+    def load_vectorstore():
+        # Load PDF
+        loader = PyPDFLoader("temp.pdf")
+        docs = loader.load()
 
-    if uploaded_file and st.session_state.rag_chain is None:
-        with st.spinner("Processing PDF and building local vector index..."):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_path = tmp_file.name
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        final_documents = text_splitter.split_documents(docs)
 
-            try:
-                # 1. Load PDF
-                loader = PyPDFLoader(tmp_path)
-                documents = loader.load()
+        # Create local embeddings model
+        embeddings = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        class SentenceTransformerEmbeddings:
+            def __init__(self, model):
+                self.model = model
+            def embed_documents(self, texts):
+                return self.model.encode(texts).tolist()
+            def embed_query(self, text):
+                return self.model.encode(text).tolist()
 
-                # 2. Split chunks (optimized size for small RAM)
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500, chunk_overlap=50
-                )
-                texts = text_splitter.split_documents(documents)
+        # Build vector store database
+        vectorstore = FAISS.from_documents(final_documents, SentenceTransformerEmbeddings(embeddings))
+        return vectorstore
 
-                # 3. Use Ollama Embeddings to save RAM (avoids loading PyTorch)
-                #embeddings = OllamaEmbeddings(model="llama3.2:3b")
-                embeddings = OllamaEmbeddings(model="nomic-embed-text")
-                
-                # 4. Build local vector store
-                vectorstore = Chroma.from_documents(texts, embeddings)
-                retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    with st.spinner("Processing PDF and building vector database..."):
+        vectorstore = load_vectorstore()
+        retriever = vectorstore.as_retriever()
 
-                # 5. Connect to ChatOllama with strict parameters
-                llm = ChatOllama(
-                    model="llama3.2:3b",
-                    temperature=0.0,      # Eliminates hallucinations
-                    num_ctx=4096          # Reduced context window to save RAM (was 8192)
-                )
+    # Initialize Groq Llama Model
+    llm = ChatGroq(groq_api_key=groq_api_key, model_name="llama-3.1-8b-instant")
 
-                # 6. Multi-turn Chat Context Manager
-                contextualize_q_system_prompt = (
-                    "Given a chat history and the latest user question "
-                    "which might reference context in the chat history, "
-                    "formulate a standalone question which can be understood "
-                    "without the chat history. Do NOT answer the question, just reformulate it if needed."
-                )
-                contextualize_q_prompt = ChatPromptTemplate.from_messages([
-                    ("system", contextualize_q_system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ])
-                history_aware_retriever = create_history_aware_retriever(
-                    llm, retriever, contextualize_q_prompt
-                )
+    # Setup LCEL RAG Chain (No legacy module dependencies)
+    template = """Answer the question based only on the following context:
+{context}
 
-                # 7. Enforce Strict Document Prompt Boundaries
-                qa_system_prompt = (
-                    "You are a helpful assistant for question-answering tasks.\n"
-                    "Use the following pieces of retrieved context to answer the question.\n"
-                    "If you don't know the answer, say exactly: 'I cannot find that in the document.'\n"
-                    "Do NOT make up information outside this context.\n\n"
-                    "<CONTEXT_START>\n"
-                    "{context}\n"
-                    "<CONTEXT_END>"
-                )
-                qa_prompt = ChatPromptTemplate.from_messages([
-                    ("system", qa_system_prompt),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ])
-                
-                # Combine into modern Retrieval Chain
-                question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-                st.session_state.rag_chain = create_retrieval_chain(
-                    history_aware_retriever, question_answer_chain
-                )
+Question: {question}
+"""
+    prompt = ChatPromptTemplate.from_template(template)
 
-                st.success("PDF processed successfully! You can now chat below.")
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
 
-    if st.session_state.rag_chain is not None:
-        if st.button("Clear Document / Reset"):
-            st.session_state.rag_chain = None
-            st.session_state.messages = []
-            st.rerun()
+    rag_chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
 
-# Main Chat Interface
-if st.session_state.rag_chain is None:
-    st.info("👈 Please upload a PDF file in the sidebar to start chatting with it.")
-else:
-    # Display chat history from UI memory
+    # Streamlit Chat Interface History
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Accept user input
-    if user_query := st.chat_input("Ask a question about your PDF..."):
-        # Display user message instantly
+    if user_query := st.chat_input("Ask something about your PDF..."):
+        st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.markdown(user_query)
 
-        # Generate streaming response from local model
         with st.chat_message("assistant"):
-            try:
-                # Convert Streamlit history format to proper LangChain Message objects
-                formatted_history = []
-                for msg in st.session_state.messages:
-                    if msg["role"] == "user":
-                        formatted_history.append(HumanMessage(content=msg["content"]))
-                    else:
-                        formatted_history.append(AIMessage(content=msg["content"]))
-
-                # Helper generator function to stream tokens chunk by chunk
-                def response_generator():
-                    for chunk in st.session_state.rag_chain.stream({
-                        "input": user_query, 
-                        "chat_history": formatted_history
-                    }):
-                        if "answer" in chunk:
-                            yield chunk["answer"]
-
-                answer = st.write_stream(response_generator())
-                
-                # Store text variables inside session state for history persistence
-                st.session_state.messages.append({"role": "user", "content": user_query})
+            with st.spinner("Thinking..."):
+                answer = rag_chain.invoke(user_query)
+                st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
-                
-            except Exception as e:
-                error_msg = f"Error generating response. Details: {e}"
-                st.error(error_msg)
+
+else:
+    st.info("👈 Please enter your Groq API key and upload a PDF in the sidebar to get started.")
