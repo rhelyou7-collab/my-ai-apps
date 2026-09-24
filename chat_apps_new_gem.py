@@ -44,8 +44,8 @@ if groq_api_key and uploaded_file:
         retriever = vectorstore.as_retriever()
 
     # Initialize Groq Llama Model
-    llm = ChatGroq(groq_api_key=groq_api_key, model_name="llama-3.1-8b-instant")
-
+    #llm = ChatGroq(groq_api_key=groq_api_key, model_name="llama-3.1-8b-instant")
+    llm = ChatGroq(groq_api_key=groq_api_key, model_name="openai/gpt-oss-20b")
     # Setup LCEL RAG Chain
     template = """Answer the question based only on the following context:
 {context}
