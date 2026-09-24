@@ -6,8 +6,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
 
 st.set_page_config(page_title="Chat with PDF - Llama & Groq", layout="centered")
 st.title("📄 Chat with PDF using Llama (via Groq Cloud)")
@@ -32,19 +32,11 @@ if groq_api_key and uploaded_file:
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         final_documents = text_splitter.split_documents(docs)
 
-        # Create local embeddings model
-        embeddings = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        class SentenceTransformerEmbeddings:
-            def __init__(self, model):
-                self.model = model
-            def embed_documents(self, texts):
-                return self.model.encode(texts).tolist()
-            def embed_query(self, text):
-                return self.model.encode(text).tolist()
+        # Use official LangChain HuggingFace embeddings (native compatibility with FAISS)
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
         # Build vector store database
-        vectorstore = FAISS.from_documents(final_documents, SentenceTransformerEmbeddings(embeddings))
+        vectorstore = FAISS.from_documents(final_documents, embeddings)
         return vectorstore
 
     with st.spinner("Processing PDF and building vector database..."):
@@ -54,7 +46,7 @@ if groq_api_key and uploaded_file:
     # Initialize Groq Llama Model
     llm = ChatGroq(groq_api_key=groq_api_key, model_name="llama-3.1-8b-instant")
 
-    # Setup LCEL RAG Chain (No legacy module dependencies)
+    # Setup LCEL RAG Chain
     template = """Answer the question based only on the following context:
 {context}
 
